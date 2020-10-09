@@ -432,7 +432,8 @@ ${colors.dim(
     chunkFileNames: 'common/[name]-[hash].js',
   };
 
-  rimraf.sync(destLoc);
+  // rimraf.sync(destLoc);
+  
   if (Object.keys(installEntrypoints).length > 0) {
     try {
       logger.debug(`running installer with options: ${util.format(inputOptions)}`);

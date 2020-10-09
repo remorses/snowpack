@@ -62,7 +62,7 @@ import {
   transformEsmImports,
   transformFileImports,
 } from '../rewrite-imports';
-import {matchDynamicImportValue} from '../scan-imports';
+import {matchDynamicImportValue, scanDepList, scanImportsFromFiles} from '../scan-imports';
 import {CommandOptions, ImportMap, SnowpackBuildMap} from '../types/snowpack';
 import {
   BUILD_CACHE,
@@ -70,6 +70,7 @@ import {
   cssSourceMappingURL,
   DEV_DEPENDENCIES_DIR,
   getExt,
+  getWebDependencyName,
   HMR_CLIENT_CODE,
   HMR_OVERLAY_CODE,
   jsSourceMappingURL,
@@ -78,6 +79,7 @@ import {
   readFile,
   replaceExt,
   resolveDependencyManifest,
+  sanitizePackageName,
   updateLockfileHash,
 } from '../util';
 import {getInstallTargets, run as installRunner} from './install';
@@ -281,21 +283,21 @@ export async function startServer(commandOptions: CommandOptions) {
 
   // Start with a fresh install of your dependencies, if needed.
   let dependencyImportMap: ImportMap = {imports: {}};
-  try {
-    dependencyImportMap = JSON.parse(
-      await fs.readFile(dependencyImportMapLoc, {encoding: 'utf-8'}),
-    );
-  } catch (err) {
-    // no import-map found, safe to ignore
-  }
+  // try {
+  //   dependencyImportMap = JSON.parse(
+  //     await fs.readFile(dependencyImportMapLoc, {encoding: 'utf-8'}),
+  //   );
+  // } catch (err) {
+  //   // no import-map found, safe to ignore
+  // }
 
-  if (!(await checkLockfileHash(DEV_DEPENDENCIES_DIR)) || !existsSync(dependencyImportMapLoc)) {
-    logger.debug('Cache out of date or missing. Updating...');
-    const installResult = await installDependencies(installCommandOptions);
-    dependencyImportMap = installResult?.importMap || dependencyImportMap;
-  } else {
-    logger.debug(`Cache up-to-date. Using existing cache`);
-  }
+  // if (!(await checkLockfileHash(DEV_DEPENDENCIES_DIR)) || !existsSync(dependencyImportMapLoc)) {
+  //   logger.debug('Cache out of date or missing. Updating...');
+  //   const installResult = await installDependencies(installCommandOptions);
+  //   dependencyImportMap = installResult?.importMap || dependencyImportMap;
+  // } else {
+  //   logger.debug(`Cache up-to-date. Using existing cache`);
+  // }
 
   const devProxies = {};
   config.proxy.forEach(([pathPrefix, proxyOptions]) => {
@@ -600,6 +602,7 @@ export async function startServer(commandOptions: CommandOptions) {
       responseExt: string,
       wrappedResponse: string,
       retryMissing = true,
+      dependencyImportMap,
     ): Promise<string> {
       let missingPackages: string[] = [];
       const resolveImportSpecifier = createImportResolver({
@@ -648,7 +651,13 @@ export async function startServer(commandOptions: CommandOptions) {
             logger.info(colors.yellow('Dependency cache out of date. Updating...'));
             const installResult = await installDependencies(installCommandOptions);
             dependencyImportMap = installResult?.importMap || dependencyImportMap;
-            return resolveResponseImports(fileLoc, responseExt, wrappedResponse, false);
+            return resolveResponseImports(
+              fileLoc,
+              responseExt,
+              wrappedResponse,
+              false,
+              dependencyImportMap,
+            );
           } catch (err) {
             const errorTitle = `Dependency Install Error`;
             const errorMessage = err.message;
@@ -746,12 +755,57 @@ export async function startServer(commandOptions: CommandOptions) {
           fileLoc,
           requestedFileExt,
           finalResponse as string,
+          true,
+          dependencyImportMap,
         );
       }
 
       // Return the finalized response.
       return finalResponse;
     }
+
+    // install module dependencies in web_modules
+    // TODO add webDependencies and knownEntrypoints
+    const {baseExt, expandedExt} = getExt(fileLoc);
+    const installTargetsFromFile = await scanImportsFromFiles(
+      [
+        {
+          baseExt,
+          expandedExt,
+          locOnDisk: fileLoc,
+          contents: await readFile(fileLoc),
+        },
+      ],
+      config,
+    );
+
+    const installTargets = [
+      ...installTargetsFromFile,
+      ...scanDepList(config.knownEntrypoints, cwd),
+      ...scanDepList(Object.keys(config.webDependencies || {}), cwd),
+    ].filter((target) => {
+      const targetName = getWebDependencyName(target.specifier);
+      const proxiedName = sanitizePackageName(targetName);
+      if (dependencyImportMap.imports[proxiedName]) {
+        console.log('reusing ' + proxiedName);
+        return false;
+      }
+      return true;
+    });
+
+    if (installTargets?.length) {
+      console.log('installing ' + installTargets.map((x) => x.specifier));
+      const installResult = await installRunner({
+        ...installCommandOptions,
+        // lockfile: dependencyImportMap,
+        installTargets,
+        shouldPrintStats: true,
+        shouldWriteLockfile: false,
+      });
+
+      dependencyImportMap = merge(dependencyImportMap, installResult.importMap);
+    }
+    console.log('finish, ', JSON.stringify(dependencyImportMap, null, 4));
 
     // 1. Check the hot build cache. If it's already found, then just serve it.
     let hotCachedResponse: SnowpackBuildMap | undefined = inMemoryBuildCache.get(
